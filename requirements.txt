@@ -1,0 +1,24 @@
+# =========================================================
+# Libyan ASR Dataset Builder Bot — Python Dependencies
+# Install with:  pip install -r requirements.txt
+# =========================================================
+
+# Telegram Bot SDK
+python-telegram-bot[job-queue]==21.6
+
+# Audio processing
+pydub==0.25.1
+
+# Speech-to-Text (Faster-Whisper — faster than openai-whisper)
+faster-whisper==1.2.1
+
+# Utilities
+pyyaml==6.0.2
+numpy==1.26.4
+
+# ── Optional GPU acceleration ──────────────────────────────────────────────
+# If you have an NVIDIA GPU, install:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Then set in config.yaml:
+#   transcription.device: cuda
+#   transcription.compute_type: float16
