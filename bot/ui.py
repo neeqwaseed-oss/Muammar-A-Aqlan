@@ -275,38 +275,64 @@ def msg_admin_panel() -> str:
 
 def msg_export_start(accepted: int) -> str:
     return (
-        "📦 *بدء عملية التصدير*\n"
+        "📦 *تصدير قاعدة البيانات*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📁 عدد الملفات  : *{accepted}* ملف صوتي\n"
-        "🔧 جارٍ إنشاء ملفات ZIP مقسّمة (٤٠ MB لكل جزء)…\n\n"
-        "_قد تستغرق العملية بعض الوقت حسب حجم القاعدة_ ⏳"
+        f"📁 الملفات المقبولة : *{accepted}* ملف صوتي\n\n"
+        "⏳ _جارٍ تجهيز الأجزاء…_"
+    )
+
+
+def msg_export_building() -> str:
+    return (
+        "📦 *تصدير قاعدة البيانات*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🗜 جارٍ ضغط الملفات وتقسيمها إلى أجزاء…\n\n"
+        "⏳ _قد يستغرق ذلك بضع دقائق حسب حجم القاعدة_"
+    )
+
+
+def msg_export_uploading(part: int, total: int, size_mb: float) -> str:
+    bar = progress_bar(part - 1, total, width=10)
+    return (
+        "📦 *تصدير قاعدة البيانات*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📤 يُرفع الجزء  : *{part}* من *{total}*\n"
+        f"💾 الحجم        : *{size_mb:.1f} MB*\n"
+        f"📊 التقدم       : `{bar}` {part - 1}/{total}\n\n"
+        "⏳ _جارٍ الرفع إلى تيليجرام…_"
     )
 
 
 def msg_export_part_caption(part: int, total: int, size_mb: float) -> str:
     return (
-        f"📦 *Libyan ASR Dataset*\n"
+        f"📦 *Libyan ASR Dataset — الجزء {part}/{total}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗂 الجزء   : *{part}* من *{total}*\n"
-        f"💾 الحجم   : *{size_mb:.1f} MB*"
+        f"💾 الحجم : *{size_mb:.1f} MB*"
     )
 
 
-def msg_export_done() -> str:
+def msg_export_done(sent: int, total: int, skipped: list | None = None) -> str:
+    skipped = skipped or []
+    skip_note = ""
+    if skipped:
+        skip_note = (
+            "\n\n⚠️ *ملفات تعذّر إرسالها (حجمها يتجاوز ٥٠ MB حتى بعد الضغط):*\n"
+            + "\n".join(f"  • `{s}`" for s in skipped)
+        )
     return (
-        "🎉 *اكتمل التصدير بنجاح!*\n"
+        "🎉 *اكتمل التصدير!*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ تم إرسال جميع أجزاء قاعدة البيانات.\n"
+        f"✅ تم إرسال *{sent}* من أصل *{total}* جزء بنجاح.\n"
         "_يمكنك الآن تنزيل الملفات واستخدامها._"
+        + skip_note
     )
 
 
 def msg_export_part_too_large(part: int, total: int, size_mb: float) -> str:
+    # Kept for backward compatibility; not used in the new flow.
     return (
-        f"⚠️ *الجزء {part} من {total} كبير جداً*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💾 الحجم : {size_mb:.1f} MB (يتجاوز حد تيليجرام ٥٠ MB)\n"
-        "_يرجى إبلاغ المطوّر._"
+        f"⚠️ *الجزء {part}/{total} كبير جداً ({size_mb:.1f} MB)*\n"
+        "_تم تخطيه — تحقق من السجل._"
     )
 
 

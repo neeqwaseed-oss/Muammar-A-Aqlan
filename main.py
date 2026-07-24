@@ -1,214 +1,115 @@
+#!/usr/bin/env python3
 """
-Queue Manager  (v2 — multi-worker)
-===================================
-A concurrent, multi-worker processing queue built on asyncio.
+Libyan ASR Dataset Builder Bot
+================================
+Entry point.  Run this file to start the bot:
 
-Design goals
-------------
-* **Concurrency** — up to ``max_workers`` files are processed simultaneously.
-  Downloading, audio conversion, and Whisper transcription all run in parallel
-  across different users, so one slow file does not block everyone else.
+    python main.py
 
-* **No filename collisions** — a dedicated ``asyncio.Lock`` (``_seq_lock``)
-  serialises only the tiny critical section: reserving the next filename,
-  moving the final WAV, and inserting the DB record.  Everything else
-  (download, pydub, Whisper) runs concurrently outside the lock.
+Prerequisites:
+  1. Install dependencies:  pip install -r requirements.txt
+  2. Install ffmpeg and add it to PATH:  https://ffmpeg.org
+  3. Set your bot token in config/config.yaml → telegram.token
 
-* **Debounced rebuild** — instead of calling ``DatasetManager.rebuild()``
-  after every single accepted file (expensive I/O), a background task
-  accumulates writes and rebuilds at most once per ``rebuild_debounce_s``
-  seconds.
-
-* **Fair queue-depth reporting** — ``depth`` counts items not yet started.
-  ``active`` counts items currently being processed.
-
-Usage
------
-    mgr = QueueManager(max_workers=3, rebuild_debounce_s=10)
-    mgr.set_processor(my_coroutine)
-    mgr.set_rebuild(dataset_mgr.rebuild_from_db)   # called after batch
-    await mgr.start()
-    ...
-    await mgr.stop()
+Conflict-prevention
+-------------------
+A PID lock file is written to ``temp/bot.pid`` on startup and removed
+on clean exit.  If the file already exists and the recorded PID is still
+alive, startup is aborted with a clear message — preventing the
+409 Conflict error that occurs when two instances poll simultaneously.
 """
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+import os
+import signal
+import sys
+from pathlib import Path
 
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-
-@dataclass
-class QueueItem:
-    chat_id: int
-    user_id: int
-    user_name: str
-    file_id: str
-    original_filename: str
-    message_id: int
+# ── make the project root importable ──────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent))
 
 
-ProcessorFn = Callable[[QueueItem, "asyncio.Lock"], Awaitable[None]]
-RebuildFn   = Callable[[], Awaitable[None]]
+def _acquire_pid_lock(pid_file: Path) -> bool:
+    """
+    Try to acquire a PID lock file.
+    Returns True if this process may proceed, False if another instance
+    is already running.
+    """
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if pid_file.exists():
+        try:
+            existing_pid = int(pid_file.read_text().strip())
+            # Check if the process is still alive
+            os.kill(existing_pid, 0)  # signal 0 = check existence only
+            # If we get here, the process is alive → another instance running
+            print(
+                f"\n⚠️  خطأ: البوت يعمل بالفعل (PID {existing_pid}).\n"
+                f"   أوقف النسخة الأخرى أولاً ثم أعد التشغيل.\n"
+                f"   أو احذف ملف القفل يدوياً: {pid_file}\n",
+                file=sys.stderr,
+            )
+            return False
+        except (ProcessLookupError, ValueError):
+            # Process is dead or PID file is corrupt — safe to overwrite
+            pid_file.unlink(missing_ok=True)
+
+    pid_file.write_text(str(os.getpid()))
+    return True
 
 
-class QueueManager:
-    """Multi-worker asyncio queue with a shared sequence lock and debounced rebuild."""
+def _release_pid_lock(pid_file: Path) -> None:
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    def __init__(
-        self,
-        max_workers: int = 3,
-        rebuild_debounce_s: float = 10.0,
-    ) -> None:
-        self._max_workers      = max_workers
-        self._rebuild_debounce = rebuild_debounce_s
 
-        self._queue:   asyncio.Queue[QueueItem] = asyncio.Queue()
-        self._processor: Optional[ProcessorFn]  = None
-        self._rebuild_fn: Optional[RebuildFn]   = None
+def main() -> None:
+    from config.settings import get_settings
+    from utils.logger import setup_logger, get_logger
 
-        # Shared lock — held only during filename reservation + DB insert.
-        # Workers acquire it for < 50 ms so concurrency is not harmed.
-        self.seq_lock: asyncio.Lock = asyncio.Lock()
+    cfg = get_settings()
 
-        # Debounced rebuild state
-        self._pending_rebuild: bool            = False
-        self._rebuild_task: Optional[asyncio.Task] = None
+    # ── Initialise logging first ───────────────────────────────────────────
+    setup_logger(
+        logs_dir=cfg.paths.logs_dir,
+        level=cfg.logging.level,
+        max_file_size_mb=cfg.logging.max_file_size_mb,
+        backup_count=cfg.logging.backup_count,
+    )
+    logger = get_logger("main")
 
-        # Worker tasks
-        self._worker_tasks: list[asyncio.Task] = []
-        self._running = False
+    # ── PID lock — prevent duplicate instances (→ 409 Conflict) ──────────
+    pid_file = cfg.paths.temp_dir / "bot.pid"
+    if not _acquire_pid_lock(pid_file):
+        sys.exit(1)
 
-        # Active counter (items currently being processed)
-        self._active = 0
+    logger.info("=" * 60)
+    logger.info("🚀 Libyan ASR Dataset Builder Bot starting…")
+    logger.info("Dataset root : %s", cfg.paths.dataset_root)
+    logger.info("Model        : %s | Device: %s",
+                cfg.transcription.model_size, cfg.transcription.device)
+    logger.info("PID lock     : %s", pid_file)
 
-    # ── public API ─────────────────────────────────────────────────────────
+    # ── Ensure required directories exist ─────────────────────────────────
+    for attr in ("original_dir", "rejected_dir", "temp_dir", "logs_dir"):
+        getattr(cfg.paths, attr).mkdir(parents=True, exist_ok=True)
 
-    def set_processor(self, fn: ProcessorFn) -> None:
-        """Register the coroutine that processes one QueueItem."""
-        self._processor = fn
+    # ── Run the bot ────────────────────────────────────────────────────────
+    from bot.bot import run_bot
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        logger.info("⏹ Interrupted by user.  Goodbye.")
+    except Exception:
+        logger.exception("💥 Fatal error — bot stopped.")
+        sys.exit(1)
+    finally:
+        _release_pid_lock(pid_file)
+        logger.info("🔓 PID lock released.")
 
-    def set_rebuild(self, fn: RebuildFn) -> None:
-        """Register the coroutine that rebuilds dataset files after a batch."""
-        self._rebuild_fn = fn
 
-    def notify_rebuild_needed(self) -> None:
-        """
-        Called by the processor when a file is accepted.
-        Schedules a debounced rebuild (runs once per batch, not per file).
-        """
-        self._pending_rebuild = True
-
-    async def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-        for i in range(self._max_workers):
-            t = asyncio.create_task(self._worker(i), name=f"queue-worker-{i}")
-            self._worker_tasks.append(t)
-        self._rebuild_task = asyncio.create_task(
-            self._rebuild_loop(), name="rebuild-loop"
-        )
-        logger.info(
-            "QueueManager started with %d workers (rebuild debounce %.0fs).",
-            self._max_workers, self._rebuild_debounce,
-        )
-
-    async def stop(self) -> None:
-        self._running = False
-        for t in self._worker_tasks:
-            t.cancel()
-        if self._rebuild_task:
-            self._rebuild_task.cancel()
-        results = await asyncio.gather(
-            *self._worker_tasks,
-            self._rebuild_task or asyncio.sleep(0),
-            return_exceptions=True,
-        )
-        self._worker_tasks.clear()
-        self._rebuild_task = None
-        logger.info("QueueManager stopped.")
-
-    def enqueue(self, item: QueueItem) -> int:
-        """Add *item* to the queue. Returns current queue depth (not yet started)."""
-        self._queue.put_nowait(item)
-        depth = self._queue.qsize()
-        logger.info(
-            "Enqueued '%s' for %s (waiting=%d, active=%d).",
-            item.original_filename, item.user_name, depth, self._active,
-        )
-        return depth
-
-    @property
-    def depth(self) -> int:
-        """Items waiting to be picked up by a worker."""
-        return self._queue.qsize()
-
-    @property
-    def active(self) -> int:
-        """Items currently being processed."""
-        return self._active
-
-    @property
-    def total_pending(self) -> int:
-        """Items waiting + items in flight."""
-        return self._queue.qsize() + self._active
-
-    # ── internal: workers ──────────────────────────────────────────────────
-
-    async def _worker(self, worker_id: int) -> None:
-        logger.debug("Worker %d started.", worker_id)
-        while self._running:
-            try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
-            self._active += 1
-            try:
-                if self._processor:
-                    # Pass the shared seq_lock so the processor can use it
-                    # for the critical filename-reservation + DB-insert step.
-                    await self._processor(item, self.seq_lock)
-            except Exception:
-                logger.exception(
-                    "Worker %d: unhandled error processing '%s'.",
-                    worker_id, item.original_filename,
-                )
-            finally:
-                self._active -= 1
-                self._queue.task_done()
-
-        logger.debug("Worker %d stopped.", worker_id)
-
-    # ── internal: debounced rebuild ────────────────────────────────────────
-
-    async def _rebuild_loop(self) -> None:
-        """
-        Sleeps for ``rebuild_debounce_s`` seconds and, if any accepted files
-        arrived in that window, triggers a single rebuild — instead of one
-        rebuild per accepted file.
-        """
-        logger.debug("Rebuild loop started (debounce=%.0fs).", self._rebuild_debounce)
-        while self._running:
-            try:
-                await asyncio.sleep(self._rebuild_debounce)
-            except asyncio.CancelledError:
-                break
-
-            if self._pending_rebuild and self._rebuild_fn:
-                self._pending_rebuild = False
-                try:
-                    logger.info("Rebuild triggered (debounced).")
-                    await self._rebuild_fn()
-                except Exception:
-                    logger.exception("Rebuild failed.")
-
-        logger.debug("Rebuild loop stopped.")
+if __name__ == "__main__":
+    main()

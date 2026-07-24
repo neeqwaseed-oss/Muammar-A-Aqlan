@@ -238,25 +238,39 @@ class BotHandlers:
             )
             return
 
-        await update.effective_message.reply_text(
+        # ── Single status message — edited in-place throughout the export ──
+        status_msg = await update.effective_message.reply_text(
             ui.msg_export_start(accepted), parse_mode="Markdown"
         )
+
+        async def _edit(text: str) -> None:
+            """Edit the shared status message silently (ignore edit races)."""
+            try:
+                await status_msg.edit_text(text, parse_mode="Markdown")
+            except Exception:
+                pass
+
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
 
+        from core.exports.exporter import ExportResult
+        result: ExportResult | None = None
         zip_paths: list[Path] = []
         try:
-            zip_paths   = self._exporter.create_zips(max_mb=40.0)
+            await _edit(ui.msg_export_building())
+            result    = self._exporter.create_zips_ex(max_mb=40.0)
+            zip_paths = result.zip_paths
             total_parts = len(zip_paths)
             logger.info("Export: %d ZIP part(s), uploading…", total_parts)
 
+            sent = 0
             for i, zp in enumerate(zip_paths, 1):
                 size_mb = zp.stat().st_size / (1024 * 1024)
+                await _edit(ui.msg_export_uploading(i, total_parts, size_mb))
+                await ctx.bot.send_chat_action(
+                    update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT
+                )
                 if zp.stat().st_size > _TELEGRAM_MAX_BYTES:
                     logger.error("ZIP part %s is %.2f MB — skipped.", zp.name, size_mb)
-                    await update.effective_message.reply_text(
-                        ui.msg_export_part_too_large(i, total_parts, size_mb),
-                        parse_mode="Markdown",
-                    )
                     continue
                 await self._send_document_with_retry(
                     ctx=ctx,
@@ -264,16 +278,15 @@ class BotHandlers:
                     file_path=zp,
                     caption=ui.msg_export_part_caption(i, total_parts, size_mb),
                 )
+                sent += 1
                 logger.info("Sent part %d/%d (%.2f MB)", i, total_parts, size_mb)
 
-            await update.effective_message.reply_text(
-                ui.msg_export_done(), parse_mode="Markdown"
-            )
+            skipped = result.skipped_files if result else []
+            await _edit(ui.msg_export_done(sent, total_parts, skipped))
+
         except Exception as exc:
             logger.exception("Export failed")
-            await update.effective_message.reply_text(
-                ui.msg_export_error(str(exc)), parse_mode="Markdown"
-            )
+            await _edit(ui.msg_export_error(str(exc)))
         finally:
             for zp in zip_paths:
                 if zp and zp.exists():
