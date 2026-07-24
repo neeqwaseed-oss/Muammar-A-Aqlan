@@ -1,27 +1,9 @@
 """
-Bot Handlers  (v2 — concurrent multi-worker)
-============================================
+Bot Handlers  (v3 — UI overhaul + concurrent multi-worker)
+===========================================================
 All Telegram command and message handlers live here.
-
-Concurrency model
------------------
-QueueManager now runs ``max_workers=3`` concurrent asyncio workers.
-Each worker calls ``_process_item(item, seq_lock)`` where *seq_lock* is
-a shared asyncio.Lock owned by QueueManager.
-
-The critical section guarded by *seq_lock* is **tiny** (< 50 ms):
-    1. next_filename()  — read MAX(id) from SQLite
-    2. shutil.move()    — rename the processed WAV into the dataset dir
-    3. insert_record()  — write one row to SQLite
-
-Everything else — file download, pydub conversion, Whisper transcription —
-runs **outside the lock** and is fully concurrent across users.
-
-Rebuild debouncing
-------------------
-Instead of calling DatasetManager.rebuild() after every accepted file
-(expensive CSV/JSON rewrite), we notify QueueManager which schedules
-a single rebuild every 10 s for any batch of accepted files.
+All user-facing strings are imported from bot.ui so this file
+stays clean and focused on logic only.
 """
 
 from __future__ import annotations
@@ -32,13 +14,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from telegram.error import TimedOut, NetworkError, RetryAfter
@@ -50,15 +26,15 @@ from core.database import DatabaseManager
 from core.dataset import DatasetManager
 from core.exports import Exporter
 from bot.queue_manager import QueueItem, QueueManager
+from bot import ui
 from utils.logger import get_logger
-from utils.file_utils import ensure_dir, human_readable_size
+from utils.file_utils import ensure_dir
 
 logger = get_logger(__name__)
 
-# Telegram hard limit for bot document uploads
-_TELEGRAM_MAX_BYTES  = 50 * 1024 * 1024  # 50 MB
-_UPLOAD_MAX_RETRIES  = 3
-_UPLOAD_RETRY_DELAY  = 5   # seconds (doubles each attempt)
+_TELEGRAM_MAX_BYTES = 50 * 1024 * 1024   # 50 MB
+_UPLOAD_MAX_RETRIES = 3
+_UPLOAD_RETRY_DELAY = 5                   # seconds (doubles each attempt)
 
 
 class BotHandlers:
@@ -66,13 +42,12 @@ class BotHandlers:
         cfg = get_settings()
         self._cfg = cfg
 
-        self._db           = DatabaseManager(cfg.paths.db_file)
-        self._audio_proc   = AudioProcessor(cfg.audio, cfg.paths.temp_dir)
-        self._transcriber  = Transcriber(cfg.transcription)
-        self._dataset_mgr  = DatasetManager(cfg.paths, cfg.splits)
-        self._exporter     = Exporter(cfg.paths, cfg.paths.temp_dir)
+        self._db          = DatabaseManager(cfg.paths.db_file)
+        self._audio_proc  = AudioProcessor(cfg.audio, cfg.paths.temp_dir)
+        self._transcriber = Transcriber(cfg.transcription)
+        self._dataset_mgr = DatasetManager(cfg.paths, cfg.splits)
+        self._exporter    = Exporter(cfg.paths, cfg.paths.temp_dir)
 
-        # 3 concurrent workers; rebuild debounced every 10 s
         self._queue = QueueManager(max_workers=3, rebuild_debounce_s=10.0)
         self._queue.set_processor(self._process_item)
         self._queue.set_rebuild(self._rebuild_dataset)
@@ -81,7 +56,7 @@ class BotHandlers:
 
     async def on_startup(self) -> None:
         await self._queue.start()
-        logger.info("BotHandlers startup complete (3 workers).")
+        logger.info("BotHandlers ready (3 concurrent workers).")
 
     async def on_shutdown(self) -> None:
         await self._queue.stop()
@@ -89,65 +64,42 @@ class BotHandlers:
     # ── /start ─────────────────────────────────────────────────────────────
 
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        text = (
-            "🎙 *مرحباً بك في Libyan ASR Dataset Builder*\n\n"
-            "أنا هنا لمساعدتك في بناء قاعدة البيانات الصوتية.\n"
-            "فقط قم برفع أي مقطع صوتي وسأقوم بمعالجته فوراً! 🚀\n\n"
-            "👇 *اختر من القائمة أدناه:*"
-        )
-        keyboard = [
-            [KeyboardButton("رفع ملف صوتي 🎙"), KeyboardButton("حالة المعالجة ⏳")],
-            [KeyboardButton("إحصائياتي 📊"),      KeyboardButton("المساعدة ❓")],
-            [KeyboardButton("📞 التواصل مع الإدارة")],
-        ]
+        name = update.effective_user.first_name or "صديق"
         await update.effective_message.reply_text(
-            text,
+            ui.msg_welcome(name),
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard, resize_keyboard=True,
-                input_field_placeholder="اختر إجراءً...",
-            ),
+            reply_markup=ui.main_keyboard(),
         )
 
     # ── /help ──────────────────────────────────────────────────────────────
 
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        text = (
-            "❓ *دليل الاستخدام:*\n\n"
-            "1️⃣ *لإضافة صوت:* فقط قم بتسجيل مقطع صوتي وإرساله، أو ارفع ملف (MP3, WAV, OGG).\n"
-            "2️⃣ *المدة المسموحة:* لا تقل عن ثانية ولا تزيد عن 30 ثانية.\n"
-            "3️⃣ *الجودة:* البوت سيقوم بتنقية الصوت وتعديل التردد تلقائياً.\n\n"
-            "لأي استفسار إضافي، استخدم زر 'التواصل مع الإدارة'."
+        await update.effective_message.reply_text(
+            ui.msg_help(), parse_mode="Markdown"
         )
-        await update.effective_message.reply_text(text, parse_mode="Markdown")
 
-    # ── معالجة النصوص ──────────────────────────────────────────────────────
+    # ── text (keyboard buttons) ────────────────────────────────────────────
 
     async def handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         text = update.message.text
-        if text == "رفع ملف صوتي 🎙":
+
+        if text == "🎙 رفع صوت":
             await update.message.reply_text(
-                "📥 أنا جاهز! فقط قم بتسجيل مقطع صوتي أو إرسال ملف صوتي الآن."
+                "📥 *جاهز!*\nأرسل أو سجّل مقطعاً صوتياً الآن.",
+                parse_mode="Markdown",
             )
-        elif text == "حالة المعالجة ⏳":
-            waiting = self._queue.depth
-            active  = self._queue.active
-            if waiting == 0 and active == 0:
-                await update.message.reply_text("✅ البوت متفرغ — لا يوجد ملفات في الانتظار.")
-            else:
-                await update.message.reply_text(
-                    f"⏳ *حالة المعالجة:*\n"
-                    f"• في الانتظار : {waiting} ملف\n"
-                    f"• قيد المعالجة: {active} ملف",
-                    parse_mode="Markdown",
-                )
-        elif text == "إحصائياتي 📊":
+        elif text == "⏳ حالة الطابور":
+            await update.message.reply_text(
+                ui.msg_queue_status(self._queue.depth, self._queue.active),
+                parse_mode="Markdown",
+            )
+        elif text == "📊 إحصائيات":
             await self.cmd_stats(update, ctx)
-        elif text == "المساعدة ❓":
+        elif text == "❓ مساعدة":
             await self.cmd_help(update, ctx)
         elif text == "📞 التواصل مع الإدارة":
             await update.message.reply_text(
-                "📩 للتواصل مع الإدارة أو الإبلاغ عن مشكلة، راسلنا على الحساب المخصص."
+                ui.msg_contact(), parse_mode="Markdown"
             )
 
     # ── admin guard ────────────────────────────────────────────────────────
@@ -160,41 +112,34 @@ class BotHandlers:
 
     async def cmd_admin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.is_admin(update.effective_user.id):
-            await update.effective_message.reply_text("⛔️ هذا الأمر مخصص للإدارة فقط.")
+            await update.effective_message.reply_text(
+                ui.msg_unauthorized(), parse_mode="Markdown"
+            )
             return
-        keyboard = [
-            [InlineKeyboardButton("📊 إحصائيات القاعدة", callback_data="admin_stats")],
-            [
-                InlineKeyboardButton("📦 تصدير (Export)",    callback_data="admin_export"),
-                InlineKeyboardButton("🔄 صيانة (Rebuild)",   callback_data="admin_rebuild"),
-            ],
-            [InlineKeyboardButton("📑 سحب سجل الأخطاء (Logs)",        callback_data="admin_logs")],
-            [InlineKeyboardButton("📢 إرسال رسالة للجميع (Broadcast)", callback_data="admin_broadcast")],
-        ]
         await update.effective_message.reply_text(
-            "⚙️ *لوحة تحكم الإدارة*\nاختر الإجراء المطلوب من الأزرار:",
+            ui.msg_admin_panel(),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=ui.admin_keyboard(),
         )
 
     # ── callback buttons ───────────────────────────────────────────────────
 
-    async def handle_admin_callbacks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_admin_callbacks(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         query = update.callback_query
         if not self.is_admin(update.effective_user.id):
-            await query.answer("⛔️ غير مصرح لك.", show_alert=True)
+            await query.answer(ui.msg_unauthorized(), show_alert=True)
             return
         await query.answer()
+
         if   query.data == "admin_stats":     await self.cmd_stats(update, ctx)
         elif query.data == "admin_export":    await self.cmd_export(update, ctx)
         elif query.data == "admin_rebuild":   await self.cmd_rebuild(update, ctx)
         elif query.data == "admin_logs":      await self.cmd_logs(update, ctx)
         elif query.data == "admin_broadcast":
             await query.message.reply_text(
-                "📢 *لإرسال رسالة لجميع المستخدمين:*\n"
-                "اكتب الأمر `/broadcast` متبوعاً برسالتك.\n\n"
-                "مثال:\n`/broadcast السلام عليكم، هناك تحديث جديد!`",
-                parse_mode="Markdown",
+                ui.msg_broadcast_guide(), parse_mode="Markdown"
             )
 
     # ── /logs ──────────────────────────────────────────────────────────────
@@ -202,76 +147,82 @@ class BotHandlers:
     async def cmd_logs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.is_admin(update.effective_user.id):
             return
-        logs_dir   = Path(self._cfg.paths.logs_dir)
-        log_files  = sorted(logs_dir.glob("*.log"), key=os.path.getmtime, reverse=True)
+        logs_dir  = Path(self._cfg.paths.logs_dir)
+        log_files = sorted(logs_dir.glob("*.log"), key=os.path.getmtime, reverse=True)
         if not log_files:
-            await update.effective_message.reply_text("⚠️ لا توجد ملفات سجل (Logs) حالياً.")
+            await update.effective_message.reply_text(
+                ui.msg_no_logs(), parse_mode="Markdown"
+            )
             return
-        latest_log = log_files[0]
-        with open(latest_log, "rb") as f:
+        with open(log_files[0], "rb") as f:
             await ctx.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=f,
-                filename=latest_log.name,
-                caption="📑 أحدث سجل للأخطاء (Logs)",
+                filename=log_files[0].name,
+                caption=ui.msg_log_caption(),
+                parse_mode="Markdown",
             )
 
     # ── /broadcast ─────────────────────────────────────────────────────────
 
-    async def cmd_broadcast(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_broadcast(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         if not self.is_admin(update.effective_user.id):
             return
         if not ctx.args:
             await update.effective_message.reply_text(
-                "⚠️ يرجى كتابة الرسالة بعد الأمر.\nمثال: `/broadcast أهلاً بكم`",
-                parse_mode="Markdown",
+                ui.msg_broadcast_guide(), parse_mode="Markdown"
             )
             return
         message = " ".join(ctx.args)
-        await update.effective_message.reply_text("⏳ جاري إرسال الرسالة...")
+        await update.effective_message.reply_text("⏳ جارٍ الإرسال…")
+
         rows  = self._db.get_accepted()
         users: set[int] = set()
         for row in rows:
-            uid = row.get("telegram_user_id") if isinstance(row, dict) else getattr(row, "telegram_user_id", None)
+            uid = (
+                row.get("telegram_user_id")
+                if isinstance(row, dict)
+                else getattr(row, "telegram_user_id", None)
+            )
             if uid:
                 users.add(uid)
+
         if not users:
-            await update.effective_message.reply_text("⚠️ لم يتم العثور على مستخدمين مسجلين.")
+            await update.effective_message.reply_text(
+                ui.msg_broadcast_no_users(), parse_mode="Markdown"
+            )
             return
+
         success = 0
         for uid in users:
             try:
                 await ctx.bot.send_message(
                     chat_id=uid,
-                    text=f"📢 *رسالة إدارية:*\n\n{message}",
+                    text=(
+                        "📢 *رسالة إدارية*\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        f"{message}"
+                    ),
                     parse_mode="Markdown",
                 )
                 success += 1
             except Exception:
                 pass
-        await update.effective_message.reply_text(f"✅ تم الإرسال بنجاح إلى {success} مستخدم.")
+
+        await update.effective_message.reply_text(
+            ui.msg_broadcast_done(success), parse_mode="Markdown"
+        )
 
     # ── /stats ─────────────────────────────────────────────────────────────
 
     async def cmd_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        stats     = self._db.get_statistics()
-        hours     = stats["total_duration_hours"]
-        avg_s     = stats["average_duration_seconds"]
-        size      = human_readable_size(stats["total_size_bytes"])
-        waiting   = self._queue.depth
-        active    = self._queue.active
-        text = (
-            "📊 *إحصائيات قاعدة البيانات*\n\n"
-            f"📁 إجمالي الملفات    : {stats['total_files']}\n"
-            f"✅ مقبولة            : {stats['accepted_files']}\n"
-            f"❌ مرفوضة           : {stats['rejected_files']}\n"
-            f"⏱ إجمالي المدة     : {hours:.2f} ساعة\n"
-            f"📏 متوسط المدة      : {avg_s:.1f} ثانية\n"
-            f"💾 المساحة المستخدمة : {size}\n"
-            f"⏳ في الانتظار      : {waiting} ملف\n"
-            f"⚡ قيد المعالجة الآن: {active} ملف"
+        stats = self._db.get_statistics()
+        await update.effective_message.reply_text(
+            ui.msg_stats(stats, self._queue.depth, self._queue.active),
+            parse_mode="Markdown",
         )
-        await update.effective_message.reply_text(text, parse_mode="Markdown")
 
     # ── /export ────────────────────────────────────────────────────────────
 
@@ -281,12 +232,14 @@ class BotHandlers:
         stats    = self._db.get_statistics()
         accepted = stats["accepted_files"]
         if accepted == 0:
-            await update.effective_message.reply_text("⚠️ لا توجد ملفات مقبولة في قاعدة البيانات بعد.")
+            await update.effective_message.reply_text(
+                "⚠️ *لا توجد ملفات*\nقاعدة البيانات فارغة حتى الآن.",
+                parse_mode="Markdown",
+            )
             return
 
         await update.effective_message.reply_text(
-            f"📦 جاري إنشاء ملف ZIP يحتوي على {accepted} ملف صوتي...\n"
-            "قد يستغرق هذا بعض الوقت."
+            ui.msg_export_start(accepted), parse_mode="Markdown"
         )
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
 
@@ -301,24 +254,26 @@ class BotHandlers:
                 if zp.stat().st_size > _TELEGRAM_MAX_BYTES:
                     logger.error("ZIP part %s is %.2f MB — skipped.", zp.name, size_mb)
                     await update.effective_message.reply_text(
-                        f"⚠️ الجزء {i} حجمه {size_mb:.1f} MB ويتجاوز حد تيليجرام (50 MB)."
+                        ui.msg_export_part_too_large(i, total_parts, size_mb),
+                        parse_mode="Markdown",
                     )
                     continue
                 await self._send_document_with_retry(
                     ctx=ctx,
                     chat_id=update.effective_chat.id,
                     file_path=zp,
-                    caption=(
-                        f"✅ *Libyan ASR Dataset* (الجزء {i} من {total_parts})\n"
-                        f"الحجم: {size_mb:.1f} MB"
-                    ),
+                    caption=ui.msg_export_part_caption(i, total_parts, size_mb),
                 )
-                logger.info("Sent ZIP part %d/%d (%.2f MB)", i, total_parts, size_mb)
+                logger.info("Sent part %d/%d (%.2f MB)", i, total_parts, size_mb)
 
-            await update.effective_message.reply_text("🎉 تم التصدير وإرسال جميع الأجزاء بنجاح!")
+            await update.effective_message.reply_text(
+                ui.msg_export_done(), parse_mode="Markdown"
+            )
         except Exception as exc:
             logger.exception("Export failed")
-            await update.effective_message.reply_text(f"❌ خطأ أثناء التصدير: {exc}")
+            await update.effective_message.reply_text(
+                ui.msg_export_error(str(exc)), parse_mode="Markdown"
+            )
         finally:
             for zp in zip_paths:
                 if zp and zp.exists():
@@ -334,7 +289,6 @@ class BotHandlers:
         file_path: Path,
         caption: str,
     ) -> None:
-        """Upload with automatic retry on transient network errors."""
         last_exc: Exception | None = None
         for attempt in range(1, _UPLOAD_MAX_RETRIES + 1):
             try:
@@ -352,9 +306,7 @@ class BotHandlers:
                     )
                 return
             except RetryAfter as exc:
-                wait = exc.retry_after + 1
-                logger.warning("Rate-limited, waiting %ds…", wait)
-                await asyncio.sleep(wait)
+                await asyncio.sleep(exc.retry_after + 1)
                 last_exc = exc
             except (TimedOut, NetworkError) as exc:
                 delay = _UPLOAD_RETRY_DELAY * (2 ** (attempt - 1))
@@ -366,28 +318,35 @@ class BotHandlers:
                 if attempt < _UPLOAD_MAX_RETRIES:
                     await asyncio.sleep(delay)
             except Exception as exc:
-                raise exc
+                raise
         raise RuntimeError(
-            f"فشل رفع '{file_path.name}' بعد {_UPLOAD_MAX_RETRIES} محاولات. آخر خطأ: {last_exc}"
+            f"فشل رفع '{file_path.name}' بعد {_UPLOAD_MAX_RETRIES} محاولات. "
+            f"آخر خطأ: {last_exc}"
         ) from last_exc
 
     # ── /rebuild ───────────────────────────────────────────────────────────
 
-    async def cmd_rebuild(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_rebuild(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         if not self.is_admin(update.effective_user.id):
             return
-        await update.effective_message.reply_text("🔄 جاري إعادة بناء ملفات Dataset…")
+        await update.effective_message.reply_text(
+            ui.msg_rebuild_start(), parse_mode="Markdown"
+        )
         rows = self._db.get_accepted()
         self._dataset_mgr.rebuild(rows)
         stats = self._db.get_statistics()
         self._dataset_mgr.update_statistics(stats)
         await update.effective_message.reply_text(
-            f"✅ تم إعادة البناء بنجاح.\n📁 إجمالي الملفات المقبولة: {stats['accepted_files']}"
+            ui.msg_rebuild_done(stats["accepted_files"]), parse_mode="Markdown"
         )
 
-    # ── audio file received ────────────────────────────────────────────────
+    # ── audio received ─────────────────────────────────────────────────────
 
-    async def handle_audio(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_audio(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         msg  = update.message
         user = msg.from_user
 
@@ -408,15 +367,15 @@ class BotHandlers:
                 original_name = doc.file_name or f"doc_{msg.message_id}.{ext}"
             else:
                 await msg.reply_text(
-                    f"⚠️ الصيغة `.{ext}` غير مدعومة.\n"
-                    f"الصيغ المدعومة: {', '.join(self._cfg.audio.supported_formats)}"
+                    ui.msg_unsupported_format(ext, self._cfg.audio.supported_formats),
+                    parse_mode="Markdown",
                 )
                 return
 
         if not tg_file:
             return
 
-        queue_depth = self._queue.enqueue(QueueItem(
+        self._queue.enqueue(QueueItem(
             chat_id=msg.chat_id,
             user_id=user.id,
             user_name=user.full_name,
@@ -424,59 +383,45 @@ class BotHandlers:
             original_filename=original_name,
             message_id=msg.message_id,
         ))
-        active = self._queue.active
-
-        if queue_depth == 0 and active > 0:
-            position_text = "📡 جارٍ المعالجة الآن…"
-        elif queue_depth > 0:
-            position_text = f"📋 موضعك في الطابور: {queue_depth}"
-        else:
-            position_text = "📡 جارٍ المعالجة الآن…"
 
         await msg.reply_text(
-            f"✅ تم استلام الملف: `{original_name}`\n{position_text}",
+            ui.msg_file_received(original_name, self._queue.depth, self._queue.active),
             parse_mode="Markdown",
         )
 
-    # ── item processor (called by QueueManager workers) ────────────────────
+    # ── item processor ─────────────────────────────────────────────────────
 
     async def _process_item(self, item: QueueItem, seq_lock: asyncio.Lock) -> None:
-        """
-        Full pipeline for one audio file.
+        cfg      = self._cfg
+        temp_dir = ensure_dir(cfg.paths.temp_dir)
+        raw_path = temp_dir / f"{item.message_id}_{item.original_filename}"
+        bot_app  = self._get_bot_app()
 
-        Steps 1-5 run CONCURRENTLY (no lock held).
-        Step 6    runs inside *seq_lock* (< 50 ms).
-        """
-        cfg       = self._cfg
-        temp_dir  = ensure_dir(cfg.paths.temp_dir)
-        raw_path  = temp_dir / f"{item.message_id}_{item.original_filename}"
-        bot_app   = self._get_bot_app()
-
-        # ── 1. download ───────────────────────────────────────────────────
+        # 1. Download
         try:
             tg_file = await bot_app.bot.get_file(item.file_id)
             await tg_file.download_to_drive(str(raw_path))
         except Exception as exc:
             await bot_app.bot.send_message(
                 item.chat_id,
-                f"❌ فشل تنزيل الملف `{item.original_filename}`: {exc}",
+                ui.msg_download_error(item.original_filename, str(exc)),
                 parse_mode="Markdown",
             )
             return
 
-        # ── 2. duplicate check (raw) ──────────────────────────────────────
+        # 2. Duplicate check (raw)
         from utils.file_utils import compute_sha256
         raw_hash = compute_sha256(raw_path)
         if self._db.hash_exists(raw_hash):
             raw_path.unlink(missing_ok=True)
             await bot_app.bot.send_message(
                 item.chat_id,
-                f"⚠️ الملف `{item.original_filename}` مكرر — تم تجاهله.",
+                ui.msg_duplicate(item.original_filename),
                 parse_mode="Markdown",
             )
             return
 
-        # ── 3. audio processing (pydub / ffmpeg) ─────────────────────────
+        # 3. Audio processing
         wav_path     = temp_dir / f"proc_{item.message_id}.wav"
         audio_result = self._audio_proc.process(raw_path, wav_path)
         raw_path.unlink(missing_ok=True)
@@ -485,24 +430,23 @@ class BotHandlers:
             self._save_rejected(item, audio_result, raw_hash)
             await bot_app.bot.send_message(
                 item.chat_id,
-                f"❌ رُفض الملف `{item.original_filename}`\nالسبب: {audio_result.rejection_reason}",
+                ui.msg_rejected(item.original_filename, audio_result.rejection_reason or ""),
                 parse_mode="Markdown",
             )
             return
 
-        # ── 4. duplicate check (processed) ───────────────────────────────
+        # 4. Duplicate check (processed)
         if self._db.hash_exists(audio_result.file_hash):
             wav_path.unlink(missing_ok=True)
             await bot_app.bot.send_message(
                 item.chat_id,
-                f"⚠️ الملف `{item.original_filename}` مكرر بعد المعالجة — تم تجاهله.",
+                ui.msg_duplicate(item.original_filename),
                 parse_mode="Markdown",
             )
             return
 
-        # ── 5. transcription (Whisper) ────────────────────────────────────
+        # 5. Transcription
         trans_result = self._transcriber.transcribe(audio_result.output_path)
-
         if not trans_result.success:
             wav_path.unlink(missing_ok=True)
             self._save_rejected(
@@ -512,19 +456,17 @@ class BotHandlers:
             )
             await bot_app.bot.send_message(
                 item.chat_id,
-                f"❌ رُفض الملف `{item.original_filename}`\nالسبب: {trans_result.rejection_reason}",
+                ui.msg_rejected(item.original_filename, trans_result.rejection_reason or ""),
                 parse_mode="Markdown",
             )
             return
 
-        # ── 6. CRITICAL SECTION: reserve filename + move + insert ─────────
-        # Lock held for < 50 ms — only the DB reads/writes and one rename.
+        # 6. CRITICAL SECTION — filename reservation + move + insert (<50 ms)
         async with seq_lock:
             wav_filename = self._db.next_filename()
             final_wav    = cfg.paths.original_dir / wav_filename
             final_wav.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(wav_path), str(final_wav))
-
             self._db.insert_record(
                 filename=wav_filename,
                 original_filename=item.original_filename,
@@ -541,13 +483,11 @@ class BotHandlers:
                 telegram_file_id=item.file_id,
             )
 
-        # ── 7. schedule debounced rebuild (non-blocking) ──────────────────
+        # 7. Schedule debounced rebuild
         self._queue.notify_rebuild_needed()
 
-        # ── 8. notify user ────────────────────────────────────────────────
+        # 8. Notify user
         stats      = self._db.get_statistics()
-        dur        = audio_result.duration_seconds
-        conf       = trans_result.confidence
         short_text = (
             trans_result.text[:80] + "…"
             if len(trans_result.text) > 80
@@ -555,28 +495,24 @@ class BotHandlers:
         )
         await bot_app.bot.send_message(
             item.chat_id,
-            f"✅ تمت المعالجة: `{wav_filename}`\n"
-            f"📝 النص: _{short_text}_\n"
-            f"⏱ المدة: {dur:.1f}s | 🎯 الثقة: {conf:.0%}\n"
-            f"📁 إجمالي الملفات: {stats['accepted_files']}",
+            ui.msg_accepted(
+                wav_filename, short_text,
+                audio_result.duration_seconds,
+                trans_result.confidence,
+                stats["accepted_files"],
+            ),
             parse_mode="Markdown",
         )
 
-    # ── debounced rebuild (called by QueueManager._rebuild_loop) ──────────
+    # ── debounced rebuild ──────────────────────────────────────────────────
 
     async def _rebuild_dataset(self) -> None:
-        """Rebuild CSV/JSON dataset files from DB. Called at most once per 10 s."""
         rows  = self._db.get_accepted()
-        await asyncio.get_event_loop().run_in_executor(
-            None, self._dataset_mgr.rebuild, rows
-        )
+        loop  = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._dataset_mgr.rebuild, rows)
         stats = self._db.get_statistics()
-        await asyncio.get_event_loop().run_in_executor(
-            None, self._dataset_mgr.update_statistics, stats
-        )
-        logger.info(
-            "Dataset rebuilt: %d accepted files.", stats["accepted_files"]
-        )
+        await loop.run_in_executor(None, self._dataset_mgr.update_statistics, stats)
+        logger.info("Dataset rebuilt: %d accepted files.", stats["accepted_files"])
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -587,7 +523,6 @@ class BotHandlers:
         file_hash: str,
         rejection_reason: Optional[str] = None,
     ) -> None:
-        reason = rejection_reason or audio_result.rejection_reason or "unknown"
         self._db.insert_record(
             filename=f"rejected_{item.message_id}.wav",
             original_filename=item.original_filename,
@@ -600,7 +535,7 @@ class BotHandlers:
             file_hash=file_hash,
             file_size=audio_result.file_size_bytes,
             processing_status="rejected",
-            rejection_reason=reason,
+            rejection_reason=rejection_reason or audio_result.rejection_reason or "unknown",
             telegram_user_id=item.user_id,
             telegram_file_id=item.file_id,
         )
