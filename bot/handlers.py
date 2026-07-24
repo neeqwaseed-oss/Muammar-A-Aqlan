@@ -220,28 +220,36 @@ class BotHandlers:
             await update.effective_message.reply_text("⚠️ لا توجد ملفات مقبولة في قاعدة البيانات بعد.")
             return
 
-        await update.effective_message.reply_text(f"📦 جاري إنشاء ملف ZIP يحتوي على {accepted} ملف صوتي…\nقد يستغرق هذا بعض الوقت.")
+        await update.effective_message.reply_text(f"📦 جاري تجهيز {accepted} ملف صوتي...\nسيتم تقسيم القاعدة تلقائياً لأجزاء (تحت 50 ميجا) لتجنب أخطاء تليجرام.")
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
 
-        zip_path: Optional[Path] = None
+        zip_paths = []
         try:
-            zip_path = self._exporter.create_zip()
-            size_mb = zip_path.stat().st_size / (1024 * 1024)
-            with open(zip_path, "rb") as f:
-                await ctx.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename=zip_path.name,
-                    caption=f"✅ *Libyan ASR Dataset*\nالملفات: {accepted}\nالحجم: {size_mb:.1f} MB",
-                    parse_mode="Markdown",
-                    read_timeout=120, write_timeout=120, connect_timeout=120
-                )
+            # استخدام دالة التقسيم الجديدة (45 ميجا كحد أقصى لكل جزء)
+            zip_paths = self._exporter.create_zips(max_mb=45.0)
+            total_parts = len(zip_paths)
+            
+            for i, zp in enumerate(zip_paths, 1):
+                size_mb = zp.stat().st_size / (1024 * 1024)
+                with open(zp, "rb") as f:
+                    await ctx.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=zp.name,
+                        caption=f"✅ *Libyan ASR Dataset* (الجزء {i} من {total_parts})\nالحجم: {size_mb:.1f} MB",
+                        parse_mode="Markdown",
+                        read_timeout=120, write_timeout=120, connect_timeout=120
+                    )
+            
+            await update.effective_message.reply_text("🎉 تم التصدير وإرسال جميع الأجزاء بنجاح!")
         except Exception as exc:
             logger.exception("Export failed")
             await update.effective_message.reply_text(f"❌ خطأ أثناء التصدير: {exc}")
         finally:
-            if zip_path and zip_path.exists():
-                zip_path.unlink(missing_ok=True)
+            # تنظيف الملفات المؤقتة بعد الإرسال
+            for zp in zip_paths:
+                if zp and zp.exists():
+                    zp.unlink(missing_ok=True)
 
     # ── /rebuild ───────────────────────────────────────────────────────────
     async def cmd_rebuild(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
