@@ -237,3 +237,4 @@ class DatabaseManager:
             "average_duration_seconds": round(avg_seconds, 2),
             "total_size_bytes":         total_bytes,
         }
+
