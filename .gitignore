@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Bot runtime data (large dataset files — do NOT commit)
+Libyan_ASR_Dataset/
+temp/
+logs/
+
+# Sensitive config — NEVER commit real tokens
+# config/config.yaml  ← keep this line if you use the placeholder token
+# Uncomment the line above to gitignore config.yaml entirely and use
+# only the TELEGRAM_TOKEN environment variable.
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

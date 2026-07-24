@@ -1,17 +1,20 @@
 FROM python:3.11-slim
 
-# تثبيت الحزم الأساسية ومكتبة الصوت (FFmpeg)
+# Install system dependencies
 RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
 
-# تحديد مسار العمل
 WORKDIR /app
 
-# نسخ ملف المتطلبات وتثبيت المكتبات
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي ملفات البوت
+# Copy project files
 COPY . .
 
-# أمر التشغيل
+# Ensure only ONE process runs (prevents 409 Conflict on Render web services).
+# Render sets WEB_CONCURRENCY=8 by default; we override it here.
+ENV WEB_CONCURRENCY=1
+
+# Start the bot
 CMD ["python", "main.py"]

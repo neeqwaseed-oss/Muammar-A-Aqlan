@@ -2,6 +2,14 @@
 Settings loader — reads config/config.yaml and exposes a typed dataclass.
 All paths are resolved relative to the project root so the bot works
 regardless of the working directory it is launched from.
+
+Token priority
+--------------
+1. TELEGRAM_TOKEN environment variable  (recommended for cloud deployments)
+2. config/config.yaml → telegram.token  (local development)
+
+Set the env var in Render's "Environment" tab (or in render.yaml) so the
+token is never committed to version control.
 """
 
 from __future__ import annotations
@@ -111,6 +119,11 @@ def _resolve(base: Path, rel: str) -> Path:
 def load_settings(config_path: Path = _CONFIG_PATH) -> Settings:
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+
+    # ── Token: env var takes priority over config file ─────────────────────
+    env_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    if env_token:
+        raw["telegram"]["token"] = env_token
 
     dataset_root = _resolve(_PROJECT_ROOT, raw["paths"]["dataset_root"])
     p = raw["paths"]

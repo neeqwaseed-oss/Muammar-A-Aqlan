@@ -1,0 +1,41 @@
+# render.yaml — Render deployment configuration
+# Docs: https://render.com/docs/blueprint-spec
+#
+# This deploys the bot as a Render Web Service so it stays alive 24/7.
+# The bot opens a health-check HTTP server on $PORT (see main.py) so
+# Render's port scanner marks the service as healthy.
+#
+# HOW TO USE
+# ----------
+# 1. Push this file to the root of your GitHub repo.
+# 2. In Render → New → Blueprint, point it at your repo.
+#    Render will detect render.yaml and create the service automatically.
+# 3. In Render → your service → Environment, add:
+#       TELEGRAM_TOKEN  =  <your BotFather token>
+# 4. (Optional) set ADMIN_USER_IDS to a comma-separated list of Telegram
+#    user IDs that should have admin access, if you prefer env vars over
+#    editing config.yaml.
+
+services:
+  - type: web            # "web" keeps the service alive; use "worker" if you
+                         # don't want port-binding checks at all.
+    name: libyan-asr-bot
+    runtime: docker      # use the Dockerfile in the repo root
+    dockerfilePath: ./Dockerfile
+
+    # Persistent disk — stores the SQLite database and audio files between
+    # deploys.  Without this, all collected data is lost on every deploy.
+    disk:
+      name: bot-data
+      mountPath: /app/Libyan_ASR_Dataset
+      sizeGB: 10         # increase as your dataset grows
+
+    envVars:
+      # CRITICAL: set your actual token in the Render dashboard, not here.
+      # Listing the key here tells Render to expect it; the value stays secret.
+      - key: TELEGRAM_TOKEN
+        sync: false      # value is set manually in the Render dashboard
+
+      # Override Render's default of 8 workers → prevents 409 Conflict
+      - key: WEB_CONCURRENCY
+        value: "1"

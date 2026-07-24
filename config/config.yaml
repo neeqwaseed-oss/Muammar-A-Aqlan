@@ -2,12 +2,20 @@
 # Libyan ASR Dataset Builder Bot — Configuration
 # Version: 1.0
 # =========================================================
+#
+# TOKEN SECURITY
+# --------------
+# Do NOT put your real token here if this file is committed to a
+# public repository.  Instead, set the TELEGRAM_TOKEN environment
+# variable in your deployment platform (Render, Railway, etc.).
+# The settings loader reads that env var first and falls back to
+# the value below only for local development.
 
 # --- Telegram ---
 telegram:
-  token: "7422012062:AAF3BPryFursjRgOSyc1_bwwqT90Ilr4Xd4"        # BotFather token
-  allowed_users: 
-    - 6337130859                      # تم إضافة ID المشرف هنا
+  token: "YOUR_BOT_TOKEN_HERE"   # overridden by TELEGRAM_TOKEN env var
+  allowed_users:
+    - 6337130859                 # Admin Telegram user ID
 
 # --- Paths ---
 paths:
@@ -46,12 +54,12 @@ audio:
 # --- Speech-to-Text (Faster-Whisper) ---
 transcription:
   model_size: "base"          # tiny / base / small / medium / large-v2
-  device: "cpu"                       # cpu or cuda
-  compute_type: "int8"                # int8 / float16 / float32
-  language: "ar"                      # ar for Arabic; null for auto-detect
-  min_confidence: 0.3                 # Reject transcriptions below this
+  device: "cpu"               # cpu or cuda
+  compute_type: "int8"        # int8 / float16 / float32
+  language: "ar"              # ar for Arabic; null for auto-detect
+  min_confidence: 0.3         # Reject transcriptions below this
   beam_size: 5
-  vad_filter: true                    # Voice Activity Detection filter
+  vad_filter: true            # Voice Activity Detection filter
 
 # --- Dataset Splits ---
 splits:
