@@ -14,6 +14,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from config.settings import get_settings
 from bot.handlers import BotHandlers
@@ -48,9 +49,21 @@ def run_bot() -> None:
 
     handlers = BotHandlers()
 
+    # ── HTTP client مع مهلات مرتفعة لدعم رفع الملفات الكبيرة ──────────────
+    # read_timeout / write_timeout مرتفعان لاستيعاب رفع ملفات ZIP تصل
+    # إلى 40 MB دون انقطاع الاتصال (httpx.ReadError / TimedOut).
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=60,
+        read_timeout=600,   # 10 دقائق — كافية لأكبر أجزاء التصدير
+        write_timeout=600,
+        pool_timeout=60,
+    )
+
     app = (
         Application.builder()
         .token(token)
+        .request(request)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
