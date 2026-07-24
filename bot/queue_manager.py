@@ -212,3 +212,4 @@ class QueueManager:
                     logger.exception("Rebuild failed.")
 
         logger.debug("Rebuild loop stopped.")
+
