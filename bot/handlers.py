@@ -6,6 +6,7 @@ All Telegram command and message handlers live here.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Optional
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
+from telegram.error import TimedOut, NetworkError, RetryAfter
 
 from config.settings import get_settings
 from core.audio import AudioProcessor
@@ -26,6 +28,13 @@ from utils.logger import get_logger
 from utils.file_utils import ensure_dir, human_readable_size
 
 logger = get_logger(__name__)
+
+# Telegram hard limit for bot document uploads
+_TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+# Number of upload retry attempts per ZIP part
+_UPLOAD_MAX_RETRIES = 3
+# Seconds to wait between retries (doubles each attempt)
+_UPLOAD_RETRY_BASE_DELAY = 5
 
 
 class BotHandlers:
@@ -212,7 +221,9 @@ class BotHandlers:
 
     # ── /export ────────────────────────────────────────────────────────────
     async def cmd_export(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.is_admin(update.effective_user.id): return
+        if not self.is_admin(update.effective_user.id):
+            return
+
         stats = self._db.get_statistics()
         accepted = stats["accepted_files"]
 
@@ -220,36 +231,115 @@ class BotHandlers:
             await update.effective_message.reply_text("⚠️ لا توجد ملفات مقبولة في قاعدة البيانات بعد.")
             return
 
-        await update.effective_message.reply_text(f"📦 جاري تجهيز {accepted} ملف صوتي...\nسيتم تقسيم القاعدة تلقائياً لأجزاء (تحت 50 ميجا) لتجنب أخطاء تليجرام.")
+        await update.effective_message.reply_text(
+            f"📦 جاري إنشاء ملف ZIP يحتوي على {accepted} ملف صوتي...\n"
+            "قد يستغرق هذا بعض الوقت."
+        )
         await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
 
         zip_paths = []
         try:
-            # استخدام دالة التقسيم الجديدة (45 ميجا كحد أقصى لكل جزء)
-            zip_paths = self._exporter.create_zips(max_mb=45.0)
+            # بناء الـ ZIP المقسّم (حد 40 ميجا لكل جزء)
+            zip_paths = self._exporter.create_zips(max_mb=40.0)
             total_parts = len(zip_paths)
-            
+
+            logger.info("Export: %d ZIP part(s) created, uploading…", total_parts)
+
             for i, zp in enumerate(zip_paths, 1):
                 size_mb = zp.stat().st_size / (1024 * 1024)
-                with open(zp, "rb") as f:
-                    await ctx.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=f,
-                        filename=zp.name,
-                        caption=f"✅ *Libyan ASR Dataset* (الجزء {i} من {total_parts})\nالحجم: {size_mb:.1f} MB",
-                        parse_mode="Markdown",
-                        read_timeout=120, write_timeout=120, connect_timeout=120
+
+                # التحقق من أن الجزء لا يتجاوز حد تيليجرام
+                if zp.stat().st_size > _TELEGRAM_MAX_BYTES:
+                    logger.error(
+                        "ZIP part %s is %.2f MB — exceeds Telegram limit, skipping.",
+                        zp.name, size_mb,
                     )
-            
+                    await update.effective_message.reply_text(
+                        f"⚠️ الجزء {i} من {total_parts} حجمه {size_mb:.1f} MB ويتجاوز حد تيليجرام (50 MB).\n"
+                        "يرجى إبلاغ المطوّر بهذه المشكلة."
+                    )
+                    continue
+
+                # إرسال مع إعادة المحاولة عند فشل الشبكة
+                await self._send_document_with_retry(
+                    ctx=ctx,
+                    chat_id=update.effective_chat.id,
+                    file_path=zp,
+                    caption=(
+                        f"✅ *Libyan ASR Dataset* (الجزء {i} من {total_parts})\n"
+                        f"الحجم: {size_mb:.1f} MB"
+                    ),
+                )
+                logger.info("Sent ZIP part %d/%d (%.2f MB)", i, total_parts, size_mb)
+
             await update.effective_message.reply_text("🎉 تم التصدير وإرسال جميع الأجزاء بنجاح!")
+
         except Exception as exc:
             logger.exception("Export failed")
             await update.effective_message.reply_text(f"❌ خطأ أثناء التصدير: {exc}")
         finally:
-            # تنظيف الملفات المؤقتة بعد الإرسال
+            # تنظيف الملفات المؤقتة
             for zp in zip_paths:
                 if zp and zp.exists():
-                    zp.unlink(missing_ok=True)
+                    try:
+                        zp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    async def _send_document_with_retry(
+        self,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        file_path: Path,
+        caption: str,
+    ) -> None:
+        """
+        Upload a document to Telegram with automatic retry on transient errors.
+        Uses long timeouts suitable for large file uploads.
+        Retries up to _UPLOAD_MAX_RETRIES times with exponential back-off.
+        """
+        last_exc: Exception | None = None
+
+        for attempt in range(1, _UPLOAD_MAX_RETRIES + 1):
+            try:
+                with open(file_path, "rb") as fh:
+                    await ctx.bot.send_document(
+                        chat_id=chat_id,
+                        document=fh,
+                        filename=file_path.name,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        # Long timeouts for large file uploads
+                        read_timeout=600,
+                        write_timeout=600,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+                return  # success
+            except RetryAfter as exc:
+                # Telegram rate-limit: wait exactly the requested amount
+                wait = exc.retry_after + 1
+                logger.warning("Rate-limited, waiting %ds before retry…", wait)
+                await asyncio.sleep(wait)
+                last_exc = exc
+            except (TimedOut, NetworkError) as exc:
+                delay = _UPLOAD_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "Upload attempt %d/%d failed (%s). Retrying in %ds…",
+                    attempt, _UPLOAD_MAX_RETRIES, exc, delay,
+                )
+                last_exc = exc
+                if attempt < _UPLOAD_MAX_RETRIES:
+                    await asyncio.sleep(delay)
+            except Exception as exc:
+                # غير قابل للاسترداد — أعد الرمي مباشرة
+                raise exc
+
+        # استُنفدت جميع المحاولات
+        raise RuntimeError(
+            f"فشل رفع الملف '{file_path.name}' بعد {_UPLOAD_MAX_RETRIES} محاولات. "
+            f"آخر خطأ: {last_exc}"
+        ) from last_exc
 
     # ── /rebuild ───────────────────────────────────────────────────────────
     async def cmd_rebuild(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,7 +356,6 @@ class BotHandlers:
         msg = update.message
         user = msg.from_user
 
-        # السماح للجميع بالمشاركة ما داموا لم يحظروا من القائمة (لو أردت حظر الجميع اترك القائمة فارغة)
         tg_file = None
         original_name = "voice.oga"
 
