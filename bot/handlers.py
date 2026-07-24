@@ -227,8 +227,16 @@ class BotHandlers:
     # ── /export ────────────────────────────────────────────────────────────
 
     async def cmd_export(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Export the full dataset as a single ZIP and deliver it to the admin's
+        Saved Messages (private chat with the bot = admin's user_id as chat_id).
+
+        If the archive exceeds Telegram's 49 MB upload limit it is split into
+        numbered binary parts; the admin can cat/join them back into one ZIP.
+        """
         if not self.is_admin(update.effective_user.id):
             return
+
         stats    = self._db.get_statistics()
         accepted = stats["accepted_files"]
         if accepted == 0:
@@ -238,60 +246,92 @@ class BotHandlers:
             )
             return
 
-        # ── Single status message — edited in-place throughout the export ──
+        # The admin's Saved Messages = their user_id as the chat_id.
+        admin_id = update.effective_user.id
+
+        # ── single status message edited in-place during the whole export ──
         status_msg = await update.effective_message.reply_text(
             ui.msg_export_start(accepted), parse_mode="Markdown"
         )
 
         async def _edit(text: str) -> None:
-            """Edit the shared status message silently (ignore edit races)."""
             try:
                 await status_msg.edit_text(text, parse_mode="Markdown")
             except Exception:
                 pass
 
-        await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
-
         from core.exports.exporter import ExportResult
-        result: ExportResult | None = None
-        zip_paths: list[Path] = []
-        try:
-            await _edit(ui.msg_export_building())
-            result    = self._exporter.create_zips_ex(max_mb=40.0)
-            zip_paths = result.zip_paths
-            total_parts = len(zip_paths)
-            logger.info("Export: %d ZIP part(s), uploading…", total_parts)
+        from datetime import datetime, timezone
 
-            sent = 0
-            for i, zp in enumerate(zip_paths, 1):
-                size_mb = zp.stat().st_size / (1024 * 1024)
-                await _edit(ui.msg_export_uploading(i, total_parts, size_mb))
-                await ctx.bot.send_chat_action(
-                    update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT
-                )
-                if zp.stat().st_size > _TELEGRAM_MAX_BYTES:
-                    logger.error("ZIP part %s is %.2f MB — skipped.", zp.name, size_mb)
-                    continue
+        result: ExportResult | None = None
+        all_parts: list[Path]       = []
+        original_zip: Path | None   = None
+
+        try:
+            # ── step 1: build the archive ──────────────────────────────────
+            info = self._exporter.get_export_info()
+            await _edit(ui.msg_export_building(total_files=info["wav_count"]))
+            await ctx.bot.send_chat_action(admin_id, ChatAction.UPLOAD_DOCUMENT)
+
+            result       = self._exporter.create_export()
+            all_parts    = result.parts
+            original_zip = result.original_zip
+            n_parts      = len(all_parts)
+            total_mb     = result.total_bytes / 1_048_576
+            timestamp    = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+            logger.info(
+                "Export ready: %d part(s), %.2f MB total → sending to admin user_id=%d",
+                n_parts, total_mb, admin_id,
+            )
+
+            # ── step 2: upload parts to admin's Saved Messages ─────────────
+            if not result.split:
+                # Happy path: single file
+                zp      = all_parts[0]
+                size_mb = zp.stat().st_size / 1_048_576
+                await _edit(ui.msg_export_uploading_single(size_mb))
+                await ctx.bot.send_chat_action(admin_id, ChatAction.UPLOAD_DOCUMENT)
+
                 await self._send_document_with_retry(
                     ctx=ctx,
-                    chat_id=update.effective_chat.id,
+                    chat_id=admin_id,
                     file_path=zp,
-                    caption=ui.msg_export_part_caption(i, total_parts, size_mb),
+                    caption=ui.msg_export_caption_single(size_mb, timestamp),
                 )
-                sent += 1
-                logger.info("Sent part %d/%d (%.2f MB)", i, total_parts, size_mb)
+                logger.info("Sent single archive (%.2f MB) to admin.", size_mb)
+                await _edit(ui.msg_export_done_single(size_mb))
 
-            skipped = result.skipped_files if result else []
-            await _edit(ui.msg_export_done(sent, total_parts, skipped))
+            else:
+                # Large archive: send each part
+                for i, zp in enumerate(all_parts, 1):
+                    size_mb = zp.stat().st_size / 1_048_576
+                    await _edit(ui.msg_export_uploading_part(i, n_parts, size_mb))
+                    await ctx.bot.send_chat_action(admin_id, ChatAction.UPLOAD_DOCUMENT)
+
+                    await self._send_document_with_retry(
+                        ctx=ctx,
+                        chat_id=admin_id,
+                        file_path=zp,
+                        caption=ui.msg_export_caption_part(i, n_parts, size_mb, timestamp),
+                    )
+                    logger.info("Sent part %d/%d (%.2f MB) to admin.", i, n_parts, size_mb)
+
+                await _edit(ui.msg_export_done_parts(n_parts, total_mb))
 
         except Exception as exc:
             logger.exception("Export failed")
             await _edit(ui.msg_export_error(str(exc)))
+
         finally:
-            for zp in zip_paths:
-                if zp and zp.exists():
+            # Clean up temp files
+            to_delete = list(all_parts)
+            if original_zip and original_zip not in to_delete:
+                to_delete.append(original_zip)
+            for p in to_delete:
+                if p and p.exists():
                     try:
-                        zp.unlink(missing_ok=True)
+                        p.unlink(missing_ok=True)
                     except Exception:
                         pass
 
