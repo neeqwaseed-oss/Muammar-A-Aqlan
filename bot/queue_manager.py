@@ -1,19 +1,35 @@
 """
-Queue Manager
-=============
-A persistent, single-worker processing queue.
+Queue Manager  (v2 — multi-worker)
+===================================
+A concurrent, multi-worker processing queue built on asyncio.
 
-Why a queue?
-  - Prevents data loss if the bot receives many files simultaneously.
-  - Ensures sequential processing so file numbering never collides.
-  - Survives restarts: any item that was "processing" at shutdown
-    is re-queued on the next startup.
+Design goals
+------------
+* **Concurrency** — up to ``max_workers`` files are processed simultaneously.
+  Downloading, audio conversion, and Whisper transcription all run in parallel
+  across different users, so one slow file does not block everyone else.
 
-Implementation: uses Python's asyncio.Queue.  A single background task
-drains the queue one item at a time, calling the provided *processor*
-coroutine.  The queue is in-memory; if the bot is killed mid-item, that
-one item is lost but all others remain (Telegram will re-deliver if the
-user resends, and deduplication via SHA-256 hash prevents double entries).
+* **No filename collisions** — a dedicated ``asyncio.Lock`` (``_seq_lock``)
+  serialises only the tiny critical section: reserving the next filename,
+  moving the final WAV, and inserting the DB record.  Everything else
+  (download, pydub, Whisper) runs concurrently outside the lock.
+
+* **Debounced rebuild** — instead of calling ``DatasetManager.rebuild()``
+  after every single accepted file (expensive I/O), a background task
+  accumulates writes and rebuilds at most once per ``rebuild_debounce_s``
+  seconds.
+
+* **Fair queue-depth reporting** — ``depth`` counts items not yet started.
+  ``active`` counts items currently being processed.
+
+Usage
+-----
+    mgr = QueueManager(max_workers=3, rebuild_debounce_s=10)
+    mgr.set_processor(my_coroutine)
+    mgr.set_rebuild(dataset_mgr.rebuild_from_db)   # called after batch
+    await mgr.start()
+    ...
+    await mgr.stop()
 """
 
 from __future__ import annotations
@@ -37,55 +53,116 @@ class QueueItem:
     message_id: int
 
 
-ProcessorFn = Callable[[QueueItem], Awaitable[None]]
+ProcessorFn = Callable[[QueueItem, "asyncio.Lock"], Awaitable[None]]
+RebuildFn   = Callable[[], Awaitable[None]]
 
 
 class QueueManager:
-    """Wraps asyncio.Queue with a single-worker drain loop."""
+    """Multi-worker asyncio queue with a shared sequence lock and debounced rebuild."""
 
-    def __init__(self) -> None:
-        self._queue: asyncio.Queue[QueueItem] = asyncio.Queue()
-        self._processor: Optional[ProcessorFn] = None
-        self._task: Optional[asyncio.Task] = None
+    def __init__(
+        self,
+        max_workers: int = 3,
+        rebuild_debounce_s: float = 10.0,
+    ) -> None:
+        self._max_workers      = max_workers
+        self._rebuild_debounce = rebuild_debounce_s
+
+        self._queue:   asyncio.Queue[QueueItem] = asyncio.Queue()
+        self._processor: Optional[ProcessorFn]  = None
+        self._rebuild_fn: Optional[RebuildFn]   = None
+
+        # Shared lock — held only during filename reservation + DB insert.
+        # Workers acquire it for < 50 ms so concurrency is not harmed.
+        self.seq_lock: asyncio.Lock = asyncio.Lock()
+
+        # Debounced rebuild state
+        self._pending_rebuild: bool            = False
+        self._rebuild_task: Optional[asyncio.Task] = None
+
+        # Worker tasks
+        self._worker_tasks: list[asyncio.Task] = []
         self._running = False
 
+        # Active counter (items currently being processed)
+        self._active = 0
+
+    # ── public API ─────────────────────────────────────────────────────────
+
     def set_processor(self, fn: ProcessorFn) -> None:
+        """Register the coroutine that processes one QueueItem."""
         self._processor = fn
+
+    def set_rebuild(self, fn: RebuildFn) -> None:
+        """Register the coroutine that rebuilds dataset files after a batch."""
+        self._rebuild_fn = fn
+
+    def notify_rebuild_needed(self) -> None:
+        """
+        Called by the processor when a file is accepted.
+        Schedules a debounced rebuild (runs once per batch, not per file).
+        """
+        self._pending_rebuild = True
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._drain(), name="queue-drain")
-        logger.info("Queue manager started.")
+        for i in range(self._max_workers):
+            t = asyncio.create_task(self._worker(i), name=f"queue-worker-{i}")
+            self._worker_tasks.append(t)
+        self._rebuild_task = asyncio.create_task(
+            self._rebuild_loop(), name="rebuild-loop"
+        )
+        logger.info(
+            "QueueManager started with %d workers (rebuild debounce %.0fs).",
+            self._max_workers, self._rebuild_debounce,
+        )
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Queue manager stopped.")
+        for t in self._worker_tasks:
+            t.cancel()
+        if self._rebuild_task:
+            self._rebuild_task.cancel()
+        results = await asyncio.gather(
+            *self._worker_tasks,
+            self._rebuild_task or asyncio.sleep(0),
+            return_exceptions=True,
+        )
+        self._worker_tasks.clear()
+        self._rebuild_task = None
+        logger.info("QueueManager stopped.")
 
     def enqueue(self, item: QueueItem) -> int:
+        """Add *item* to the queue. Returns current queue depth (not yet started)."""
         self._queue.put_nowait(item)
-        size = self._queue.qsize()
+        depth = self._queue.qsize()
         logger.info(
-            "Enqueued %s for user %s (queue depth=%d)",
-            item.original_filename, item.user_name, size,
+            "Enqueued '%s' for %s (waiting=%d, active=%d).",
+            item.original_filename, item.user_name, depth, self._active,
         )
-        return size
+        return depth
 
     @property
     def depth(self) -> int:
+        """Items waiting to be picked up by a worker."""
         return self._queue.qsize()
 
-    # ── internal ───────────────────────────────────────────────────────────
+    @property
+    def active(self) -> int:
+        """Items currently being processed."""
+        return self._active
 
-    async def _drain(self) -> None:
-        logger.info("Queue drain loop running.")
+    @property
+    def total_pending(self) -> int:
+        """Items waiting + items in flight."""
+        return self._queue.qsize() + self._active
+
+    # ── internal: workers ──────────────────────────────────────────────────
+
+    async def _worker(self, worker_id: int) -> None:
+        logger.debug("Worker %d started.", worker_id)
         while self._running:
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
@@ -94,10 +171,44 @@ class QueueManager:
             except asyncio.CancelledError:
                 break
 
+            self._active += 1
             try:
                 if self._processor:
-                    await self._processor(item)
+                    # Pass the shared seq_lock so the processor can use it
+                    # for the critical filename-reservation + DB-insert step.
+                    await self._processor(item, self.seq_lock)
             except Exception:
-                logger.exception("Unhandled error processing %s", item.original_filename)
+                logger.exception(
+                    "Worker %d: unhandled error processing '%s'.",
+                    worker_id, item.original_filename,
+                )
             finally:
+                self._active -= 1
                 self._queue.task_done()
+
+        logger.debug("Worker %d stopped.", worker_id)
+
+    # ── internal: debounced rebuild ────────────────────────────────────────
+
+    async def _rebuild_loop(self) -> None:
+        """
+        Sleeps for ``rebuild_debounce_s`` seconds and, if any accepted files
+        arrived in that window, triggers a single rebuild — instead of one
+        rebuild per accepted file.
+        """
+        logger.debug("Rebuild loop started (debounce=%.0fs).", self._rebuild_debounce)
+        while self._running:
+            try:
+                await asyncio.sleep(self._rebuild_debounce)
+            except asyncio.CancelledError:
+                break
+
+            if self._pending_rebuild and self._rebuild_fn:
+                self._pending_rebuild = False
+                try:
+                    logger.info("Rebuild triggered (debounced).")
+                    await self._rebuild_fn()
+                except Exception:
+                    logger.exception("Rebuild failed.")
+
+        logger.debug("Rebuild loop stopped.")
