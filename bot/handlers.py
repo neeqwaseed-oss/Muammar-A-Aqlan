@@ -547,3 +547,4 @@ class BotHandlers:
 
     def _get_bot_app(self):
         return self.__class__._bot_app
+
